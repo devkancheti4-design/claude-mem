@@ -1302,3 +1302,111 @@ describe('fileHasMoreLinesThan', () => {
     expect(fileHasMoreLinesThan(tmpDir, 1)).toBeNull();
   });
 });
+
+describe('fileContextHandler — line anchors (#4943)', () => {
+  const lineOf = (index: number) => `export const fixtureValue${index} = ${index}; // read-gate fixture line`;
+
+  function answerWithAnchoredHistory(
+    observations: Array<{ id: number; created_at_epoch: number; title: string; anchors?: Array<{ line: number; text: string }> }>,
+  ): void {
+    fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify({
+        observations: observations.map(o => ({
+          id: o.id,
+          memory_session_id: `session-${o.id}`,
+          title: o.title,
+          type: 'bugfix',
+          created_at_epoch: o.created_at_epoch,
+          files_read: JSON.stringify([]),
+          files_modified: JSON.stringify([gatedFile]),
+          metadata: o.anchors ? JSON.stringify({ anchors: o.anchors.map(a => ({ path: gatedFile, ...a })) }) : null,
+        })),
+        count: observations.length,
+      }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ));
+  }
+
+  function setFileAge(file: string, msAgo: number): void {
+    const seconds = (Date.now() - msAgo) / 1000;
+    utimesSync(file, seconds, seconds);
+  }
+
+  const targetedRead = (overrides: Partial<NormalizedHookInput> = {}): NormalizedHookInput => ({
+    sessionId: 'sess-anchors',
+    cwd: tmpDir,
+    platform: 'claude-code',
+    toolName: 'Read',
+    toolInput: { file_path: gatedFile, offset: 100, limit: 20 },
+    ...overrides,
+  });
+
+  it('shows where anchored past work is now, after lines were added above it', async () => {
+    writeFileSync(gatedFile, `// a new header line\n// and another\n${GATED_FILE_CONTENT}`);
+    setFileAge(gatedFile, 3_600_000);
+    answerWithAnchoredHistory([{ id: 7, created_at_epoch: Date.now(), title: 'Fixed value 120', anchors: [{ line: 121, text: lineOf(120) }] }]);
+
+    const context = (await fileContextHandler.execute(targetedRead())).hookSpecificOutput!.additionalContext!;
+
+    expect(context).toContain('Fixed value 120 @L123');
+    expect(context).toContain('**@L numbers** are where past work in this file is now');
+  });
+
+  it('marks an anchored observation whose code is gone, and adds no @L hint', async () => {
+    setFileAge(gatedFile, 3_600_000);
+    answerWithAnchoredHistory([{ id: 8, created_at_epoch: Date.now(), title: 'Removed helper', anchors: [{ line: 10, text: 'export function removedHelper() {' }] }]);
+
+    const context = (await fileContextHandler.execute(targetedRead())).hookSpecificOutput!.additionalContext!;
+
+    expect(context).toContain('Removed helper (code changed since)');
+    expect(context).not.toContain('@L numbers');
+  });
+
+  it('lists only observations whose code was found again when the file changed after them (#1719)', async () => {
+    const older = Date.now() - 3_600_000;
+    answerWithAnchoredHistory([
+      { id: 1, created_at_epoch: older, title: 'Still there', anchors: [{ line: 200, text: lineOf(199) }] },
+      { id: 2, created_at_epoch: older + 1, title: 'No anchors' },
+      { id: 3, created_at_epoch: older + 2, title: 'Code gone', anchors: [{ line: 5, text: 'export const removed = true;' }] },
+    ]);
+
+    const result = await fileContextHandler.execute(targetedRead());
+    const context = result.hookSpecificOutput!.additionalContext!;
+
+    expect(context).toContain('Still there @L200');
+    expect(context).toContain('The file changed after these observations');
+    expect(context).not.toContain('No anchors');
+    expect(context).not.toContain('Code gone');
+  });
+
+  it('still skips a changed file when no observation\'s code was found again', async () => {
+    answerWithAnchoredHistory([
+      { id: 1, created_at_epoch: Date.now() - 3_600_000, title: 'Code gone', anchors: [{ line: 5, text: 'export const removed = true;' }] },
+    ]);
+
+    expect(await fileContextHandler.execute(targetedRead())).toEqual({ continue: true, suppressOutput: true });
+  });
+
+  it('never denies a whole-file Read of a file that changed after its history, even with anchors found', async () => {
+    answerWithAnchoredHistory([
+      { id: 1, created_at_epoch: Date.now() - 3_600_000, title: 'Still there', anchors: [{ line: 200, text: lineOf(199) }] },
+    ]);
+
+    const result = await fileContextHandler.execute(targetedRead({ toolInput: { file_path: gatedFile } }));
+
+    expect(result.hookSpecificOutput?.permissionDecision).toBeUndefined();
+    expect(result.hookSpecificOutput?.additionalContext).toContain('Still there @L200');
+  });
+
+  it('points the deny reason at the anchored lines when the gate denies', async () => {
+    setFileAge(gatedFile, 3_600_000);
+    answerWithAnchoredHistory([{ id: 9, created_at_epoch: Date.now(), title: 'Fixed value 300', anchors: [{ line: 301, text: lineOf(300) }] }]);
+
+    const output = (await fileContextHandler.execute(targetedRead({ toolInput: { file_path: gatedFile } }))).hookSpecificOutput!;
+
+    expect(output.permissionDecision).toBe('deny');
+    expect(output.permissionDecisionReason).toContain('Full-file Read blocked by claude-mem:');
+    expect(output.permissionDecisionReason).toContain('**@L numbers** are where past work in this file is now');
+    expect(output.permissionDecisionReason).toContain('Fixed value 300 @L301');
+  });
+});

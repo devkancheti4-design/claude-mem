@@ -6,7 +6,7 @@ import type { EventHandler, NormalizedHookInput, HookResult } from '../types.js'
 import { executeWithWorkerFallback, isWorkerFallback } from '../../shared/worker-utils.js';
 import { logger } from '../../utils/logger.js';
 import { parseJsonArray, formatTime, formatDate, formatHeaderDateTime } from '../../shared/timeline-formatting.js';
-import { closeSync, openSync, readSync, statSync } from 'fs';
+import { closeSync, openSync, readFileSync, readSync, statSync } from 'fs';
 import path from 'path';
 import { shouldTrackProject } from '../../shared/should-track-project.js';
 import { loadFromFileOnce } from '../../shared/hook-settings.js';
@@ -18,6 +18,7 @@ import { claimFileContextInjection } from './file-context-dedupe.js';
 import { memorySearchHandler } from './memory-search.js';
 import { isQwenCodeHookEvent } from './session-init.js';
 import { resolveRuntimeContext } from '../../services/hooks/runtime-selector.js';
+import { anchorFileLines, readLineAnchors, relocateLineAnchor } from '../../shared/line-anchors.js';
 
 /** Below this a file gets neither the timeline nor a deny: reading it costs about what the timeline would. */
 const FILE_CONTEXT_MIN_BYTES = 1_500;
@@ -67,6 +68,16 @@ interface ObservationRow {
   created_at_epoch: number;
   files_read: string | null;
   files_modified: string | null;
+  /** JSON; its `anchors` say where in which files this observation's work was (#4943). */
+  metadata?: string | null;
+}
+
+/** An observation's anchors on the file being read, looked up in the file as it is now. */
+interface AnchorStatus {
+  /** Current 1-based lines of the anchors found again, in stored order. */
+  lines: number[];
+  /** Anchors on this file that were not found: that code changed. */
+  missing: number;
 }
 
 function deduplicateObservations(
@@ -121,6 +132,14 @@ interface FileObservationHistory {
   fileStatVerified: boolean;
   /** The size the lookup stat'ed; 0 when the stat failed. */
   fileSizeBytes: number;
+  /**
+   * The file changed after its newest observation. Only observations whose
+   * anchors were all found again are listed then, as context: the gate never
+   * denies a Read of a file that changed since its history (#1719).
+   */
+  fileChangedSinceObservations?: boolean;
+  /** Anchor lookups for the displayed observations that have anchors on this file, by observation id. */
+  anchorStatus?: Map<number, AnchorStatus>;
 }
 
 /** Escapes a path for the quoted tool-call hints (backslashes, quotes, newlines). */
@@ -132,7 +151,10 @@ function escapePathForHint(filePath: string): string {
  * The day-grouped history both outputs share: `### <day>`, then one
  * `<id> <time> <icon> <title>` line per observation. Expects oldest-first rows.
  */
-function formatObservationTimeline(observationsOldestFirst: ObservationRow[]): string[] {
+function formatObservationTimeline(
+  observationsOldestFirst: ObservationRow[],
+  anchorStatus?: Map<number, AnchorStatus>,
+): string[] {
   const lines: string[] = [];
   let currentDay: string | null = null;
   for (const obs of observationsOldestFirst) {
@@ -144,9 +166,24 @@ function formatObservationTimeline(observationsOldestFirst: ObservationRow[]): s
     const title = (obs.title || 'Untitled').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
     const icon = TYPE_ICONS[obs.type] || '\u2753';
     const time = compactTime(formatTime(obs.created_at_epoch));
-    lines.push(`${obs.id} ${time} ${icon} ${title}`);
+    lines.push(`${obs.id} ${time} ${icon} ${title}${formatAnchorSuffix(anchorStatus?.get(obs.id))}`);
   }
   return lines;
+}
+
+/** ` @L120,L342` where the observation's code is now, or a note that it changed. */
+function formatAnchorSuffix(status: AnchorStatus | undefined): string {
+  if (!status) return '';
+  if (status.lines.length === 0) return ' (code changed since)';
+  return ` @${status.lines.map(line => `L${line}`).join(',')}${status.missing > 0 ? ' (some code changed since)' : ''}`;
+}
+
+/** The hint both outputs add when the timeline carries current line numbers. */
+function anchorHint(history: FileObservationHistory): string[] {
+  if (!history.anchorStatus || ![...history.anchorStatus.values()].some(status => status.lines.length > 0)) return [];
+  return [
+    `- **@L numbers** are where past work in this file is now, found again by its exact line: Read with offset and limit around them instead of the whole file.`,
+  ];
 }
 
 function formatFileContextTimeline(history: FileObservationHistory): string {
@@ -156,7 +193,11 @@ function formatFileContextTimeline(history: FileObservationHistory): string {
     `This file has prior observations — supplementary context follows. The Read result below is the full requested section.`,
     `- **Need details on a past observation?** get_observations([IDs]) — ~300 tokens each.`,
     `- **Need a structural map first?** smart_outline("${safePath}") — line numbers only, cheaper than re-reading.`,
-    ...formatObservationTimeline(history.displayedObservations),
+    ...anchorHint(history),
+    ...(history.fileChangedSinceObservations
+      ? [`The file changed after these observations; only those whose code was found again are listed.`]
+      : []),
+    ...formatObservationTimeline(history.displayedObservations, history.anchorStatus),
   ].join('\n');
 }
 
@@ -171,8 +212,9 @@ function formatFullFileReadDenyReason(history: FileObservationHistory): string {
     `- Current code: call smart_outline(file_path="${safePath}") for its symbols and line numbers, then smart_unfold(file_path="${safePath}", symbol_name="<name>") for the ones you need (MCP tools mcp__plugin_claude-mem_mcp-search__smart_outline / __smart_unfold; load them with ToolSearch if they are deferred).`,
     `- Past work: call get_observations(ids=[${displayedIds}]) for the observations below that matter (~300 tokens each).`,
     `- Exact lines, e.g. before an Edit: call Read on this file again with offset and limit around the lines smart_outline reported. Partial reads are allowed and satisfy Edit's read requirement.`,
+    ...anchorHint(history),
     `The titles below are history from earlier sessions, not the file's current contents.`,
-    ...formatObservationTimeline(history.displayedObservations),
+    ...formatObservationTimeline(history.displayedObservations, history.anchorStatus),
   ].join('\n');
 }
 
@@ -259,7 +301,7 @@ async function fileResolvesInsideWorkspace(filePath: string, workspaceCwd: strin
  */
 function isFullFileReadGateCandidate(
   input: NormalizedHookInput,
-  fileHistory: Pick<FileObservationHistory, 'absolutePath' | 'fileStatVerified' | 'fileSizeBytes'>,
+  fileHistory: Pick<FileObservationHistory, 'absolutePath' | 'fileStatVerified' | 'fileSizeBytes' | 'fileChangedSinceObservations'>,
   fileReadGateSetting: string | undefined,
 ): boolean {
   if (input.platform !== 'claude-code') return false;
@@ -275,6 +317,8 @@ function isFullFileReadGateCandidate(
 
   // A failed stat skipped the size and mtime checks; a claude-mem failure must never block a Read.
   if (!fileHistory.fileStatVerified) return false;
+  // History older than the file is context only (#1719), even where anchors found its code again.
+  if (fileHistory.fileChangedSinceObservations) return false;
   if (fileHistory.fileSizeBytes < FILE_READ_GATE_DENY_MIN_BYTES) return false;
   if (UNGATED_LANGUAGES.has(detectLanguage(fileHistory.absolutePath))) return false;
   if (!input.cwd) return false;
@@ -293,7 +337,7 @@ function isFullFileReadGateCandidate(
  */
 export function shouldDenyFullFileRead(
   input: NormalizedHookInput,
-  fileHistory: Pick<FileObservationHistory, 'absolutePath' | 'fileStatVerified' | 'fileSizeBytes'> | null,
+  fileHistory: Pick<FileObservationHistory, 'absolutePath' | 'fileStatVerified' | 'fileSizeBytes' | 'fileChangedSinceObservations'> | null,
   fileReadGateSetting: string | undefined,
   fileIsInsideWorkspace: boolean,
   fileHasMoreLinesThan: (absolutePath: string, lineCount: number) => boolean | null,
@@ -507,21 +551,71 @@ async function lookupFileObservationHistory(
   }
 
   const newestObservationMs = Math.max(...data.observations.map(o => o.created_at_epoch));
+  const anchorStatus = lookUpAnchors(data.observations, absolutePath, cwd);
+  const fileChangedSinceObservations = fileMtimeMs > 0 && fileMtimeMs >= newestObservationMs;
+  let candidates = data.observations;
 
-  if (fileMtimeMs > 0 && fileMtimeMs >= newestObservationMs) {
-    logger.debug('HOOK', 'File modified since last observation, skipping context injection', {
-      filePath: relativePath,
-      fileMtimeMs,
-      newestObservationMs,
+  if (fileChangedSinceObservations) {
+    // #1719: history older than the file may describe code that is gone. An
+    // observation whose anchors were all found again still points at code
+    // that is there, so it stays; everything else is skipped, as before.
+    candidates = data.observations.filter(obs => {
+      const status = anchorStatus.get(obs.id);
+      return !!status && status.lines.length > 0 && status.missing === 0;
     });
-    return null;
+    if (candidates.length === 0) {
+      logger.debug('HOOK', 'File modified since last observation, skipping context injection', {
+        filePath: relativePath,
+        fileMtimeMs,
+        newestObservationMs,
+      });
+      return null;
+    }
   }
 
-  // Never empty: the `observations.length === 0` guard above already returned,
-  // and deduplicateObservations only ever drops same-session duplicates and
+  // Never empty: candidates has at least one row here, and
+  // deduplicateObservations only ever drops same-session duplicates and
   // truncates to DISPLAY_LIMIT, so at least one row always survives.
-  const displayedObservations = deduplicateObservations(data.observations, relativePath, DISPLAY_LIMIT)
+  const displayedObservations = deduplicateObservations(candidates, relativePath, DISPLAY_LIMIT)
     .sort((a, b) => a.created_at_epoch - b.created_at_epoch);
 
-  return { filePath, absolutePath, relativePath, newestObservationMs, displayedObservations, fileStatVerified, fileSizeBytes };
+  return {
+    filePath, absolutePath, relativePath, newestObservationMs, displayedObservations, fileStatVerified, fileSizeBytes,
+    fileChangedSinceObservations, anchorStatus,
+  };
+}
+
+/**
+ * Looks up, in the file as it is now, every anchor the observations hold on
+ * it (#4943). The file is read only when at least one observation has an
+ * anchor on it; an unreadable file yields no statuses, so nothing is claimed.
+ */
+function lookUpAnchors(observations: ObservationRow[], absolutePath: string, cwd: string): Map<number, AnchorStatus> {
+  const statuses = new Map<number, AnchorStatus>();
+  const onThisFile = observations
+    .map(obs => ({
+      id: obs.id,
+      anchors: readLineAnchors(obs.metadata).filter(anchor => path.resolve(cwd, anchor.path) === absolutePath),
+    }))
+    .filter(entry => entry.anchors.length > 0);
+  if (onThisFile.length === 0) return statuses;
+
+  let fileLines: string[];
+  try {
+    fileLines = anchorFileLines(readFileSync(absolutePath, 'utf8'));
+  } catch (err) {
+    logger.debug('HOOK', 'Could not read file to look up line anchors', {
+      absolutePath,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return statuses;
+  }
+  for (const { id, anchors } of onThisFile) {
+    const found = anchors.map(anchor => relocateLineAnchor(anchor, fileLines));
+    statuses.set(id, {
+      lines: found.filter((line): line is number => line !== null),
+      missing: found.filter(line => line === null).length,
+    });
+  }
+  return statuses;
 }

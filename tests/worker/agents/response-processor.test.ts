@@ -1,5 +1,5 @@
 import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
-import { existsSync, readFileSync, mkdtempSync, rmSync } from 'fs';
+import { existsSync, readFileSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { paths } from '../../../src/shared/paths.js';
@@ -647,6 +647,63 @@ describe('ResponseProcessor', () => {
 
       const [, , observations] = mockStoreObservations.mock.calls[0];
       expect(observations[0].files_modified).toEqual(['src/services/worker/agents/ResponseProcessor.ts']);
+    });
+
+    it('stores line anchors for the batch\'s edits in metadata (#4943)', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'response-processor-anchors-'));
+      const editedFile = join(dir, 'charge.ts');
+      writeFileSync(editedFile, 'import { retry } from "./retry";\n\nexport const MAX_CHARGE_RETRIES = 4;\n');
+      try {
+        claimedMessages = [
+          { type: 'observation', tool_name: 'Edit', tool_input: { file_path: editedFile, old_string: '= 3;', new_string: 'export const MAX_CHARGE_RETRIES = 4;' } },
+        ];
+
+        const session = createMockSession();
+        const responseText = `
+          <observation>
+            <type>bugfix</type>
+            <title>Raised the charge retry limit</title>
+            <narrative>Four tries before a card charge fails.</narrative>
+            <facts><fact>MAX_CHARGE_RETRIES is 4</fact></facts>
+            <concepts><concept>payments</concept></concepts>
+            <files_read></files_read>
+            <files_modified><file>${editedFile}</file></files_modified>
+          </observation>
+        `;
+
+        await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent');
+
+        const [, , observations] = mockStoreObservations.mock.calls[0];
+        expect(JSON.parse(observations[0].metadata)).toEqual({
+          anchors: [{ path: editedFile, line: 3, text: 'export const MAX_CHARGE_RETRIES = 4;' }],
+        });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('stores no metadata when the batch has nothing to anchor', async () => {
+      claimedMessages = [
+        { type: 'observation', tool_name: 'Read', tool_input: { file_path: 'src/read-only.ts' } },
+      ];
+
+      const session = createMockSession();
+      const responseText = `
+        <observation>
+          <type>discovery</type>
+          <title>Read the file</title>
+          <narrative>Whole-file reads point at no line.</narrative>
+          <facts><fact>Read once</fact></facts>
+          <concepts><concept>reading</concept></concepts>
+          <files_read><file>src/read-only.ts</file></files_read>
+          <files_modified></files_modified>
+        </observation>
+      `;
+
+      await processAgentResponse(responseText, session, mockDbManager, mockSessionManager, mockWorker, 100, null, 'TestAgent');
+
+      const [, , observations] = mockStoreObservations.mock.calls[0];
+      expect(observations[0].metadata).toBeUndefined();
     });
 
     it('keeps native records scoped to their originating project', async () => {

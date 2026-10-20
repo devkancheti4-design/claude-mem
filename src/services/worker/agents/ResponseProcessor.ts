@@ -31,6 +31,7 @@ import type { WorkerRef, StorageResult } from './types.js';
 import { broadcastObservation, broadcastSummary } from './ObservationBroadcaster.js';
 import { telemetryBuffer } from '../../telemetry/buffer.js';
 import { logChromaWriteFailure } from '../search/errors.js';
+import { anchorsForObservation, deriveLineAnchors, withLineAnchors } from '../../../shared/line-anchors.js';
 
 type ObservationFileEvidenceMessage = Pick<PendingMessage, 'type' | 'tool_name' | 'tool_input'>;
 
@@ -705,11 +706,19 @@ export async function processAgentResponse(
       dropped: sanitizedObservations.length - storableObservations.length,
     });
   }
-  const labeledObservations = storableObservations.map(obs => ({
-    ...obs,
-    agent_type: context.pendingAgentType,
-    agent_id: context.pendingAgentId
-  }));
+  // Line anchors (#4943): where in each named file this batch's edits and
+  // targeted reads landed, read from the claimed tool calls, so the
+  // file-context hook can find that code again after the file changes.
+  const lineAnchors = deriveLineAnchors(claimedMessages);
+  const labeledObservations = storableObservations.map(obs => {
+    const anchors = anchorsForObservation(obs, lineAnchors);
+    return {
+      ...obs,
+      agent_type: context.pendingAgentType,
+      agent_id: context.pendingAgentId,
+      ...(anchors.length > 0 ? { metadata: withLineAnchors(null, anchors) } : {})
+    };
+  });
 
   let result: ReturnType<typeof sessionStore.storeObservations>;
   try {
